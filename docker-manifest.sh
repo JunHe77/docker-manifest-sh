@@ -107,9 +107,6 @@ get_image()
     "${REPO_REGISTRY}/${repo}/blobs/$digest"
 }
 
-REPOSITORY=$1
-manifest_digests=""
-image_digests=""
 
 process_option()
 {
