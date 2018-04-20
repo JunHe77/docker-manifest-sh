@@ -365,7 +365,6 @@ process_create()
     manifests_list=$LIST_TEMPLATE
     > ${OUTPUT_DIR}/$$-images.json
     for image in $images_list; do
-        #echo $image
         image_length=$(echo $image | cut -d ',' -f 1)
         image_digest=$(echo $image | cut -d ',' -f 2)
         image_os=$(echo $image | cut -d ',' -f 3)
@@ -400,10 +399,21 @@ process_annotate()
                 opt=$(echo $1 | sed -e 's/^-*//')
                 case "$opt" in
                     # save value
-                    os|arch|os-features|variant)
+                    os|variant)
                         OPTIONS["$opt"]="$2"
                         shift
                     ;;
+                    arch)
+                        OPTIONS["architecture"]="$2"
+                        shift
+                    ;;
+                    os-features)
+                        # string slice
+                        value=$(echo "$2" | sed -e 's/\,/\"\,\"/g')
+                        OPTIONS["os.features"]="[\"$value\"]"
+                        shift
+                    ;;
+
                     # default is to mark the option selected-"Y"
                     *)
                         OPTIONS["$opt"]="Y"
@@ -418,11 +428,6 @@ process_annotate()
         shift
     done
 
-    for i in "${!OPTIONS[@]}"; do
-      echo "key  : $i"
-      echo "value: ${OPTIONS[$i]}"
-    done
-
     should_fail="NO"
 
     # get manifests list content
@@ -431,25 +436,30 @@ process_annotate()
     list_repo=$(echo ${MANIFESTS[0]} | cut -d ':' -f 1)
     list_tag=$(echo ${MANIFESTS[0]} | cut -d ':' -f 2)
     list_name="$(echo $list_repo | sed -e 's|/|\#|')#$list_tag"
-    echo "list_name: $list_name"
     if [ -f ${OUTPUT_DIR}/${list_name}#manifest.json ]; then
         list_content=$(cat ${OUTPUT_DIR}/${list_name}#manifest.json)
     else
+        printf "Cannot find ${CYAN}[${MANIFESTS[0]}]${NC} in cache.\n"
+        read -p "Download to proceed? (Y/N) : " choice
+        [ "N" == "$choice" ] && exit 1
+
         # load manifests-list access token
         target=${MANIFESTS[0]}
-        echo "Reading: [$target]"
+        printf "Reading: [${CYAN}$target${NC}]\n"
         repo=$(echo "$target" | cut -d ':' -f 1)
         token=${TOKENS[${repo}]}
         if [ -z "$token" ]; then
-            printf "Requesting access token ..."
+            printf "\tRequesting access token ..."
             token=$(get_token $repo)
             TOKENS[${repo}]=$token
-            printf " Done\n"
+            printf " ${GREEN}Done${NC}\n"
         fi
         # read from registry
+        printf "\tLoading manifests list ..."
         list_content=$(get_manifests_list $target $token)
+        printf " ${GREEN}Done${NC}\n"
     fi
-    list_count=$(echo -E "$list_content" | jq '.manifests | length')
+    list_count=$(echo "$list_content" | jq '.manifests | length')
 
 
     if [ $list_count -gt 0 ]; then
@@ -457,54 +467,69 @@ process_annotate()
         for ((i=1; i <${#MANIFESTS[@]}; i++)); do
             target=${MANIFESTS[$i]}
 
+            # read digest associates with given target
+            # search target manifest-digest in list
+            # append/modify fields if target exists
+
             # get token for this repo
             repo=$(echo "$target" | cut -d ':' -f 1)
             token=${TOKENS[${repo}]}
             if [ -z "$token" ]; then
-            token=$(get_token $repo)
-            TOKENS[${repo}]=$token
+                token=$(get_token $repo)
+                TOKENS[${repo}]=$token
             fi
 
-            # check if $target is image manifest
             # check if specified item is a manifest list.
-            # manifest-list cannot be added
             api_resp=$(get_manifests_list $target $token)
             list_count=$(echo "$api_resp" | jq '.manifests | length')
             if [ $list_count -gt 0 ]; then
-                echo "[ERROR] Specified [$target] is not an image manifest"
+                printf "[${RED}ERROR${NC}] [${CYAN}$target${NC}] is not an image\n"
                 exit 1
             fi
 
-            # get digest to target manifest
+            # get digest of target manifest
             get_manifest $target $token "-I -D /tmp/$$.txt" > /dev/null
             header=$(cat /tmp/$$.txt)
             content_length=$(echo "$header" | grep 'Content-Length' | tr -d ' \n\r' | cut -d ':' -f 2)
             digest=$(echo "$header" | grep 'Docker-Content-Digest' | tr -d '\n\r' | cut -d ' ' -f 2)
             rm /tmp/$$.txt
 
-            # search this digest in $list_resp
-            found=$(echo $list_resp | grep "$digest" | wc -l)
+            # search this digest in $list_content
+            found=$(echo $list_content | grep "$digest" | wc -l)
             if [ 0 -eq $found ]; then
                 echo "[ERROR] Specified [$target] is not in ${MANIFESTS[0]}"
                 exit 1
             else
                 # add fields
-                echo "To be done ..."
-				exit 0
+                export MS_DIGEST=$digest
+                for this_field in architecture variant os "os.features"; do
+                    if [ ! -z ${OPTIONS[${this_field}]} ]; then
+                        export FIELD=${this_field}
+                        export VALUE="${OPTIONS[${this_field}]}"
+                        if [ "$FIELD" == "os.features" ]; then
+                        list_content=$(echo -E "$list_content" | jq '(.manifests[] | select(.digest == "'$MS_DIGEST'").platform."'$FIELD'") = '$VALUE'')
+                        else
+                        list_content=$(echo -E "$list_content" | jq '(.manifests[] | select(.digest == "'$MS_DIGEST'").platform."'$FIELD'") = "'$VALUE'"')
+                        fi
+                        unset FIELD
+                        unset VALUE
+                    fi
+                done
+                unset MS_DIGEST
             fi
         done
+        # save to cache
+        echo "$list_content" | jq . -M > ${OUTPUT_DIR}/${list_name}#manifest.json
     else
-        echo "[ERROR] [$target] is not a manifest list"
+        printf "[${RED}ERROR${NC}] [${CYAN}$target${NC}] is not a manifest list\n"
         should_fail="YES"
     fi
-    # read image-manifest info
-    # search target manifest-digest in list
-    # append/modify fields if target exists
+
 }
 
 process_inspect()
 {
-    if [ "--help" == "$1" ] || [ $# -lt 2 ]; then
+    if [ "--help" == "$1" ] || [ $# -lt 1 ]; then
         show_inspect_help
         exit 1
     fi
@@ -552,7 +577,8 @@ process_inspect()
 
 process_push()
 {
-    if [ "--help" == "$1" ] || [ $# -lt 2 ]; then
+    echo $#
+    if [ "--help" == "$1" ] || [ $# -lt 1 ]; then
         show_push_help
         exit 1
     fi
